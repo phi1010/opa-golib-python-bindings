@@ -50,6 +50,17 @@ class OpaEngine:
         self.print_handler = None
         #: Prints captured by the most recent eval, as (message, location).
         self.last_prints = []
+        #: Coverage report of the most recent eval with ``coverage=True``:
+        #: {"files": {path: {"covered": [...], "not_covered": [...], ...}},
+        #:  "covered_lines": int, "not_covered_lines": int, "coverage": float}.
+        #: None if the last eval did not capture coverage.
+        self.last_coverage = None
+        #: Evaluation trace of the most recent eval with ``trace=True``: a
+        #: list of event dicts {"op", "query_id", "parent_id", "location",
+        #: "node", "locals", "message"} in evaluation order, where "locals"
+        #: holds the variable bindings live at that point. None if the last
+        #: eval did not capture a trace.
+        self.last_trace = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -90,7 +101,16 @@ class OpaEngine:
             raise OpaError(err.get("code", "unknown"), err.get("message", ""))
         return envelope
 
+    def _eval_reset(self):
+        # Clear per-eval state up front so a failed eval never leaves stale
+        # results from a previous evaluation behind.
+        self.last_coverage = None
+        self.last_trace = None
+        self.last_prints = []
+
     def _eval_result(self, envelope):
+        self.last_coverage = envelope.get("coverage")
+        self.last_trace = envelope.get("trace")
         self.last_prints = [
             (p["message"], p["location"]) for p in envelope.get("prints") or []
         ]
@@ -166,24 +186,50 @@ class OpaEngine:
             del self._functions[name]
             raise
 
-    def eval_query(self, query: str, input=None):
-        """Evaluate a Rego query; returns a list of binding dicts."""
+    def eval_query(
+        self, query: str, input=None, *, coverage: bool = False, trace: bool = False
+    ):
+        """Evaluate a Rego query; returns a list of binding dicts.
+
+        With ``coverage=True`` the evaluation is traced and a coverage report
+        over all added policies is stored in ``self.last_coverage``. With
+        ``trace=True`` the full event trace, including the variable bindings
+        at each step, is stored in ``self.last_trace``.
+        """
         self._check_open()
+        self._eval_reset()
         rs = self._eval_result(
-            self._call(self._lib.OpaEvalQuery, query.encode(), _encode_input(input))
+            self._call(
+                self._lib.OpaEvalQuery,
+                query.encode(),
+                _encode_input(input),
+                int(coverage),
+                int(trace),
+            )
         )
         if not rs:
             return []
         return [r.get("bindings", {}) for r in rs]
 
-    def eval_document(self, path: str, input=None):
+    def eval_document(
+        self, path: str, input=None, *, coverage: bool = False, trace: bool = False
+    ):
         """Evaluate the document at ``data.<path>`` and return its value.
 
-        Raises OpaUndefinedError if the document is undefined.
+        Raises OpaUndefinedError if the document is undefined. With
+        ``coverage=True`` a coverage report is stored in ``self.last_coverage``;
+        with ``trace=True`` the event trace is stored in ``self.last_trace``.
         """
         self._check_open()
+        self._eval_reset()
         rs = self._eval_result(
-            self._call(self._lib.OpaEvalDocument, path.encode(), _encode_input(input))
+            self._call(
+                self._lib.OpaEvalDocument,
+                path.encode(),
+                _encode_input(input),
+                int(coverage),
+                int(trace),
+            )
         )
         if not rs or not rs[0].get("expressions"):
             raise OpaUndefinedError(f"data.{path}" if path else "data")

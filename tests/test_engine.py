@@ -144,6 +144,91 @@ r := x if {
     assert "pr.rego" in loc
 
 
+def test_coverage_capture(engine):
+    engine.add_policy(
+        "cov.rego",
+        """
+package cov
+
+a := 1
+
+b := 2 if {
+    input.flag
+}
+""",
+    )
+    assert engine.last_coverage is None
+    assert engine.eval_document("cov", {"flag": False}) == {"a": 1}
+    assert engine.last_coverage is None  # coverage off by default
+
+    assert engine.eval_document("cov", {"flag": False}, coverage=True) == {"a": 1}
+    report = engine.last_coverage
+    fr = report["files"]["cov.rego"]
+    def rows(ranges):
+        return {row for r in ranges for row in range(r["start"]["row"], r["end"]["row"] + 1)}
+
+    assert 4 in rows(fr["covered"])  # a := 1
+    assert 7 in rows(fr["covered"])  # input.flag was evaluated (to false)
+    assert 6 in rows(fr["not_covered"])  # rule head of b never succeeded
+    assert 0 < report["coverage"] < 100
+
+    engine.eval_document("cov", {"flag": True}, coverage=True)
+    fr = engine.last_coverage["files"]["cov.rego"]
+    assert not fr.get("not_covered")
+    assert engine.last_coverage["coverage"] == 100
+
+    # a subsequent eval without coverage clears the report
+    engine.eval_document("cov", {"flag": True})
+    assert engine.last_coverage is None
+
+    # a failed eval does not leave a stale report behind
+    engine.eval_document("cov", {"flag": True}, coverage=True)
+    engine.register_function("boom_cov", lambda: 1 / 0)
+    engine.add_policy("boom.rego", "package boom\n\nr := boom_cov()\n")
+    with pytest.raises(OpaError):
+        engine.eval_document("boom.r", coverage=True)
+    assert engine.last_coverage is None
+
+
+def test_trace_capture(engine):
+    engine.add_policy(
+        "t.rego",
+        """
+package t
+
+r := x if {
+    x := input.n * 2
+    x > 3
+}
+""",
+    )
+    assert engine.eval_document("t.r", {"n": 3}) == 6
+    assert engine.last_trace is None  # trace off by default
+
+    assert engine.eval_document("t.r", {"n": 3}, trace=True) == 6
+    trace = engine.last_trace
+    assert trace and all("op" in ev for ev in trace)
+    # The rule body was entered and exited (the rule succeeded) ...
+    rule_events = [ev for ev in trace if ev.get("location", "").startswith("t.rego:")]
+    assert any(ev["op"] == "Exit" for ev in rule_events)
+    # ... and the bound value of x is visible in the event locals.
+    assert any(ev.get("locals", {}).get("x") == 6 for ev in rule_events)
+    # Compiler temporaries are filtered out of locals.
+    assert not any(
+        name.startswith(("__local", "$"))
+        for ev in trace
+        for name in ev.get("locals", {})
+    )
+
+    # A failing condition shows up as a Fail event at its location.
+    with pytest.raises(OpaUndefinedError):
+        engine.eval_document("t.r", {"n": 1}, trace=True)
+    assert any(ev["op"] == "Fail" for ev in engine.last_trace)
+
+    engine.eval_document("t.r", {"n": 3})
+    assert engine.last_trace is None
+
+
 def test_multiple_engines_isolated():
     with OpaEngine() as a, OpaEngine() as b:
         a.add_data({"k": 1})

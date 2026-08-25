@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/cover"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"github.com/open-policy-agent/opa/v1/topdown/print"
@@ -187,21 +188,21 @@ func OpaRegisterBuiltin(h C.ulonglong, name *C.char, arity C.int, cb C.opa_callb
 }
 
 //export OpaEvalQuery
-func OpaEvalQuery(h C.ulonglong, query, inputJson *C.char) *C.char {
-	return evalCommon(h, C.GoString(query), inputJson)
+func OpaEvalQuery(h C.ulonglong, query, inputJson *C.char, coverage, trace C.int) *C.char {
+	return evalCommon(h, C.GoString(query), inputJson, coverage != 0, trace != 0)
 }
 
 //export OpaEvalDocument
-func OpaEvalDocument(h C.ulonglong, docPath, inputJson *C.char) *C.char {
+func OpaEvalDocument(h C.ulonglong, docPath, inputJson *C.char, coverage, trace C.int) *C.char {
 	p := C.GoString(docPath)
 	q := "data"
 	if p != "" {
 		q = "data." + p
 	}
-	return evalCommon(h, q, inputJson)
+	return evalCommon(h, q, inputJson, coverage != 0, trace != 0)
 }
 
-func evalCommon(h C.ulonglong, query string, inputJson *C.char) *C.char {
+func evalCommon(h C.ulonglong, query string, inputJson *C.char, coverage, trace bool) *C.char {
 	e, err := getEngine(h)
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
@@ -243,11 +244,36 @@ func evalCommon(h C.ulonglong, query string, inputJson *C.char) *C.char {
 	}
 	collector := &printCollector{}
 	evalOpts = append(evalOpts, rego.EvalPrintHook(collector))
+	var cov *cover.Cover
+	if coverage {
+		cov = cover.New()
+		evalOpts = append(evalOpts, rego.EvalQueryTracer(cov))
+	}
+	var tracer *traceCollector
+	if trace {
+		tracer = &traceCollector{}
+		evalOpts = append(evalOpts, rego.EvalQueryTracer(tracer))
+	}
 	rs, err := pq.Eval(context.Background(), evalOpts...)
 	if err != nil {
 		return errorJSON("eval_error", err.Error())
 	}
-	b, err := json.Marshal(map[string]any{"result": rs, "prints": collector.msgs})
+	envelope := map[string]any{"result": rs, "prints": collector.msgs}
+	if cov != nil {
+		e.mu.Lock()
+		parsed := map[string]*ast.Module{}
+		for path, src := range e.modules {
+			if m, perr := ast.ParseModule(path, src); perr == nil {
+				parsed[path] = m
+			}
+		}
+		e.mu.Unlock()
+		envelope["coverage"] = cov.Report(parsed)
+	}
+	if tracer != nil {
+		envelope["trace"] = tracer.events
+	}
+	b, err := json.Marshal(envelope)
 	if err != nil {
 		return errorJSON("internal", err.Error())
 	}

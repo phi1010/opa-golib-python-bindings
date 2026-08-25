@@ -43,9 +43,21 @@ def load():
     ]
 
     lib.OpaEvalQuery.restype = ctypes.c_void_p
-    lib.OpaEvalQuery.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p]
+    lib.OpaEvalQuery.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,  # coverage
+        ctypes.c_int,  # trace
+    ]
 
     lib.OpaEvalDocument.restype = ctypes.c_void_p
-    lib.OpaEvalDocument.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p]
+    lib.OpaEvalDocument.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,  # coverage
+        ctypes.c_int,  # trace
+    ]
 
     return lib

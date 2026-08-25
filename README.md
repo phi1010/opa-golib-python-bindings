@@ -43,6 +43,20 @@ Notes:
 - Builtin arguments and return values are JSON-compatible objects. A callback exception
   becomes an evaluation error; returning is fine.
 - An undefined document raises `OpaUndefinedError`.
+- Pass `coverage=True` to `eval_document` / `eval_query` to capture a coverage
+  report (OPA's `cover` tracer) in `engine.last_coverage`: per-file `covered` /
+  `not_covered` line ranges plus line counts and a coverage percentage over all
+  added policies. Evaluating without `coverage=True` resets it to `None`.
+- Pass `trace=True` to capture the full evaluation trace in `engine.last_trace`:
+  a list of event dicts (`op`, `location`, `node`, `locals`, ...) in evaluation
+  order. `locals` holds the plugged variable bindings live at each step, so the
+  value a statement produced is visible (e.g. `{"x": 6}` after `x := input.n * 2`);
+  a false condition appears as a `Fail` event at its location. An undefined
+  document still carries its trace — the main way to see which condition failed. Note that `node`
+  shows the compiler-rewritten expression (temporaries like `__local0__`), a
+  statement may appear multiple times (`Redo` on backtracking), and tracing
+  slows evaluation, so keep it opt-in per call. Coverage only records *which*
+  statements were evaluated; traces are how to see their results.
 - Rego `print(...)` output is captured per evaluation: set `engine.print_handler`
   to a `callable(message, location)` to receive it (default: written to stderr);
   `engine.last_prints` holds the `(message, location)` pairs of the last eval.
