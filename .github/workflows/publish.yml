@@ -31,9 +31,9 @@ jobs:
         include:
           - os: ubuntu-24.04
           - os: ubuntu-24.04-arm
-          - os: macos-13 # x86_64
+          - os: macos-15-intel # x86_64
             plat: macosx_11_0_x86_64
-          - os: macos-latest # arm64
+          - os: macos-15 # arm64
             plat: macosx_11_0_arm64
     runs-on: ${{ matrix.os }}
     steps:
@@ -48,6 +48,8 @@ jobs:
       - name: Build wheel
         env:
           OPA_BINDINGS_PLAT: ${{ matrix.plat }}
+          # Keep the macOS binary compatible with the macosx_11_0 wheel tag.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: python -m build --wheel
       - name: Repair Linux wheel (manylinux tag)
         if: runner.os == 'Linux'
