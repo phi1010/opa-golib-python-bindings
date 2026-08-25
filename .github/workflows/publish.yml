@@ -1,0 +1,88 @@
+# Builds platform wheels (the wheel bundles a Go c-shared library, so one
+# wheel per OS/arch, independent of the Python version) plus an sdist, and
+# publishes to PyPI via trusted publishing (OIDC — no API token; configure
+# this repo/workflow as a trusted publisher on pypi.org first).
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: make build
+      - run: pip install pytest && python -m pytest tests/ -v
+
+  build-wheels:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: ubuntu-22.04-arm
+          - os: macos-13 # x86_64
+            plat: macosx_11_0_x86_64
+          - os: macos-latest # arm64
+            plat: macosx_11_0_arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install build
+      - name: Build wheel
+        env:
+          OPA_BINDINGS_PLAT: ${{ matrix.plat }}
+        run: python -m build --wheel
+      - name: Repair Linux wheel (manylinux tag)
+        if: runner.os == 'Linux'
+        run: |
+          pip install auditwheel
+          auditwheel repair dist/*.whl -w wheelhouse
+          rm dist/*.whl && mv wheelhouse/*.whl dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
+
+  build-sdist:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install build && python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

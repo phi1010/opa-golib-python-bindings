@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+src/opa_bindings/libopabridge.so
+src/opa_bindings/libopabridge.h
+dist/
