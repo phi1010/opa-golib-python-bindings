@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/opa-python-bindings.iml" filepath="$PROJECT_DIR$/.idea/opa-python-bindings.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/opa-golib-python-bindings.iml" filepath="$PROJECT_DIR$/.idea/opa-golib-python-bindings.iml" />
     </modules>
   </component>
 </project>
