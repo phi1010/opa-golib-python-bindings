@@ -235,3 +235,341 @@ def test_multiple_engines_isolated():
         b.add_data({"k": 2})
         assert a.eval_document("k") == 1
         assert b.eval_document("k") == 2
+
+
+FILTERS = """
+package filters
+
+include if input.fruits.colour == "green"
+
+include if {
+    input.fruits.name == "banana"
+    input.user == "admin"
+}
+"""
+
+
+def test_compile_filters_sql(engine):
+    engine.add_policy("filters.rego", FILTERS)
+    result = engine.compile_filters(
+        "data.filters.include",
+        {"user": "admin"},
+        unknowns=["input.fruits"],
+        target="sql",
+        dialect="postgresql",
+    )
+    # The OR branches come from separate rules; their order is not guaranteed.
+    assert result["query"] in (
+        "WHERE (fruits.colour = E'green' OR fruits.name = E'banana')",
+        "WHERE (fruits.name = E'banana' OR fruits.colour = E'green')",
+    )
+    assert result["masks"] is None
+
+
+def test_compile_filters_ucast(engine):
+    engine.add_policy("filters.rego", FILTERS)
+    result = engine.compile_filters(
+        "data.filters.include",
+        {"user": "nobody"},
+        unknowns=["input.fruits"],
+        target="ucast",
+        dialect="prisma",
+    )
+    assert result["query"] == {
+        "type": "field",
+        "field": "fruits.colour",
+        "operator": "eq",
+        "value": "green",
+    }
+
+
+def test_compile_filters_mappings(engine):
+    engine.add_policy("filters.rego", FILTERS)
+    result = engine.compile_filters(
+        "data.filters.include",
+        {"user": "nobody"},
+        unknowns=["input.fruits"],
+        target="sql",
+        dialect="sqlite",
+        mappings={"fruits": {"$self": "f", "colour": "col"}},
+    )
+    assert result["query"] == "WHERE f.col = 'green'"
+
+
+def test_compile_filters_never_and_always(engine):
+    engine.add_policy("filters.rego", FILTERS)
+    # No rule can match: query is None (never satisfied).
+    never = engine.compile_filters(
+        "data.filters.no_such_rule",
+        unknowns=["input.fruits"],
+    )
+    assert never["query"] is None
+    # Trivially true query: empty WHERE clause (always satisfied).
+    always = engine.compile_filters("1 == 1", unknowns=["input.fruits"])
+    assert always["query"] == ""
+
+
+def test_compile_filters_untranslatable(engine):
+    engine.add_policy(
+        "bad.rego",
+        'package bad\n\ninclude if regex.match("^a", input.fruits.name)\n',
+    )
+    with pytest.raises(OpaError) as exc:
+        engine.compile_filters("data.bad.include", unknowns=["input.fruits"])
+    assert exc.value.code == "compile_error"
+
+
+# An EAV (entity-attribute-value) database delivers rows like
+# attr(entity_id, key, type, value_string, value_number, value_bool,
+# value_de, value_en, ...): one typed value column per datatype and one
+# localized value column per locale. The filter translator only accepts refs
+# of the form <unknown>.<column>, so policies address these flat columns; the
+# locale (and hence the column) is picked dynamically from the known input.
+EAV = """
+package eav
+
+# Localized match: the value column is chosen by the requested locale.
+include if input.attr[sprintf("value_%s", [input.locale])] == "Banane"
+
+# Typed match: numeric comparison guarded by the datatype tag.
+include if {
+    input.attr.type == "number"
+    input.attr.value_number < 10
+}
+
+# Differing datatypes: boolean and null-valued attributes.
+include if input.attr.value_bool == true
+include if input.attr.value_string == null
+"""
+
+
+def test_compile_filters_eav_sql(engine):
+    engine.add_policy("eav.rego", EAV)
+    result = engine.compile_filters(
+        "data.eav.include",
+        {"locale": "de"},
+        unknowns=["input.attr"],
+        target="sql",
+        dialect="postgresql",
+    )
+    clauses = result["query"].removeprefix("WHERE (").removesuffix(")").split(" OR ")
+    assert sorted(clauses) == [
+        "(attr.type = E'number' AND attr.value_number < E'10')",
+        "attr.value_bool = TRUE",
+        "attr.value_de = E'Banane'",
+        "attr.value_string IS NULL",
+    ]
+    # A different locale selects a different column.
+    result = engine.compile_filters(
+        "data.eav.include",
+        {"locale": "en"},
+        unknowns=["input.attr"],
+        target="sql",
+        dialect="postgresql",
+    )
+    assert "attr.value_en = E'Banane'" in result["query"]
+    assert "value_de" not in result["query"]
+
+
+def test_compile_filters_eav_ucast(engine):
+    engine.add_policy("eav.rego", EAV)
+    result = engine.compile_filters(
+        "data.eav.include",
+        {"locale": "de"},
+        unknowns=["input.attr"],
+        target="ucast",
+        dialect="prisma",
+    )
+    top = result["query"]
+    assert top["type"] == "compound" and top["operator"] == "or"
+    leaves = {}
+    for cond in top["value"]:
+        conds = cond["value"] if cond["type"] == "compound" else [cond]
+        for c in conds:
+            leaves[(c["field"], c["operator"])] = c["value"]
+    # Datatypes survive as native JSON types (no stringification as in SQL).
+    assert leaves == {
+        ("attr.value_de", "eq"): "Banane",
+        ("attr.type", "eq"): "number",
+        ("attr.value_number", "lt"): 10,
+        ("attr.value_bool", "eq"): True,
+        ("attr.value_string", "eq"): None,
+    }
+
+
+def test_compile_filters_eav_entity_attribute_join(engine):
+    # The classic two-table EAV shape: entities joined to attribute rows.
+    engine.add_policy(
+        "join.rego",
+        """
+        package join
+
+        include if {
+            input.item.id == input.attr.entity_id
+            input.attr.key == "name"
+            input.attr.value_de == "Banane"
+        }
+        """,
+    )
+    result = engine.compile_filters(
+        "data.join.include",
+        unknowns=["input.item", "input.attr"],
+        target="sql",
+        dialect="postgresql",
+    )
+    assert result["query"] == (
+        "WHERE (item.id = attr.entity_id AND attr.key = E'name'"
+        " AND attr.value_de = E'Banane')"
+    )
+
+
+def test_compile_filters_eav_localized_from_data(engine):
+    # Translations stored as data: iterating them ORs all localized spellings.
+    engine.add_policy(
+        "loc.rego",
+        "package loc\n\ninclude if input.attr.value == data.translations.banana[_]\n",
+    )
+    engine.add_data({"banana": {"de": "Banane", "en": "banana"}}, path="translations")
+    result = engine.compile_filters(
+        "data.loc.include", unknowns=["input.attr"], target="sql", dialect="sqlite"
+    )
+    assert sorted(result["query"].removeprefix("WHERE (").removesuffix(")").split(" OR ")) == [
+        "attr.value = 'Banane'",
+        "attr.value = 'banana'",
+    ]
+
+
+def test_compile_filters_eav_nested_document_unsupported(engine):
+    # A document-shaped EAV input ({"attrs": {"price": {"type": ..., "value":
+    # ...}}}) cannot be translated: only refs of the exact shape
+    # input.<table>.<column> are accepted, for every target/dialect
+    # (ucast/all included). Flatten to columns (as above) instead.
+    engine.add_policy(
+        "nested.rego",
+        "package nested\n\ninclude if input.item.attrs.price.value < 10\n",
+    )
+    for target, dialect in [("sql", "postgresql"), ("ucast", "all")]:
+        with pytest.raises(OpaError) as exc:
+            engine.compile_filters(
+                "data.nested.include",
+                unknowns=["input.item"],
+                target=target,
+                dialect=dialect,
+            )
+        assert exc.value.code == "compile_error"
+        assert "invalid ref operand" in exc.value.message
+
+
+def test_compile_filters_ref_shape_is_input_table_column(engine):
+    # The two segments are counted from input, not from the unknown: the bare
+    # unknown "input" admits input.<table>.<column>, while a narrower unknown
+    # only admits one further segment.
+    engine.add_policy(
+        "shape.rego",
+        """
+        package shape
+
+        two if input.attrs.name == "x"
+        three if input.item.attrs.name == "x"
+        """,
+    )
+    result = engine.compile_filters(
+        "data.shape.two", unknowns=["input"], target="ucast", dialect="all"
+    )
+    assert result["query"] == {
+        "type": "field",
+        "field": "attrs.name",
+        "operator": "eq",
+        "value": "x",
+    }
+    with pytest.raises(OpaError) as exc:
+        engine.compile_filters(
+            "data.shape.three",
+            unknowns=["input.item"],
+            target="ucast",
+            dialect="all",
+        )
+    assert "invalid ref operand" in exc.value.message
+
+
+def test_compile_filters_eav_known_types_unknown_values(engine):
+    # EAV split across two tables: attrs_types (attribute key -> datatype) is
+    # known metadata, attrs_values (one column per attribute key) is the
+    # unknown. Partial evaluation iterates the known types table and expands
+    # it into concrete per-column conditions on the unknown values table.
+    engine.add_policy(
+        "eav2.rego",
+        """
+        package eav2
+
+        include if {
+            some key, type in data.attrs_types
+            type == "number"
+            input.attrs_values[key] < 10
+        }
+
+        include if {
+            some key, type in data.attrs_types
+            type == "string"
+            input.attrs_values[key] == "Banane"
+        }
+        """,
+    )
+    engine.add_data(
+        {"price": "number", "qty": "number", "name": "string", "organic": "bool"},
+        path="attrs_types",
+    )
+
+    result = engine.compile_filters(
+        "data.eav2.include",
+        unknowns=["input.attrs_values"],
+        target="sql",
+        dialect="postgresql",
+    )
+    clauses = result["query"].removeprefix("WHERE (").removesuffix(")").split(" OR ")
+    assert sorted(clauses) == [
+        "attrs_values.name = E'Banane'",
+        "attrs_values.price < E'10'",
+        "attrs_values.qty < E'10'",
+    ]  # no condition for "organic": no rule covers datatype "bool"
+
+    result = engine.compile_filters(
+        "data.eav2.include",
+        unknowns=["input.attrs_values"],
+        target="ucast",
+        dialect="all",
+    )
+    top = result["query"]
+    assert top["type"] == "compound" and top["operator"] == "or"
+    assert sorted(
+        (c["field"], c["operator"], c["value"]) for c in top["value"]
+    ) == [
+        ("attrs_values.name", "eq", "Banane"),
+        ("attrs_values.price", "lt", 10),
+        ("attrs_values.qty", "lt", 10),
+    ]
+
+
+def test_compile_filters_eav_known_types_from_input(engine):
+    # The known types table can also arrive as (known) input alongside the
+    # unknown values table under the same input document.
+    engine.add_policy(
+        "eav3.rego",
+        """
+        package eav3
+
+        include if {
+            some key, type in input.attrs_types
+            type == "number"
+            input.attrs_values[key] < 10
+        }
+        """,
+    )
+    result = engine.compile_filters(
+        "data.eav3.include",
+        {"attrs_types": {"price": "number", "name": "string"}},
+        unknowns=["input.attrs_values"],
+        target="sql",
+        dialect="postgresql",
+    )
+    assert result["query"] == "WHERE attrs_values.price < E'10'"

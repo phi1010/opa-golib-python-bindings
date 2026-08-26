@@ -60,4 +60,16 @@ def load():
         ctypes.c_int,  # trace
     ]
 
+    lib.OpaCompileFilters.restype = ctypes.c_void_p
+    lib.OpaCompileFilters.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_char_p,  # query
+        ctypes.c_char_p,  # input JSON
+        ctypes.c_char_p,  # unknowns JSON array
+        ctypes.c_char_p,  # target
+        ctypes.c_char_p,  # dialect
+        ctypes.c_char_p,  # mappings JSON
+        ctypes.c_char_p,  # mask rule ref
+    ]
+
     return lib

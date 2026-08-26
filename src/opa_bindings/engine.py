@@ -235,6 +235,62 @@ class OpaEngine:
             raise OpaUndefinedError(f"data.{path}" if path else "data")
         return rs[0]["expressions"][0]["value"]
 
+    def compile_filters(
+        self,
+        query: str,
+        input=None,
+        *,
+        unknowns=("input",),
+        target: str = "sql",
+        dialect: str = "postgresql",
+        mappings=None,
+        mask_rule: str | None = None,
+    ):
+        """Partially evaluate ``query`` and translate it into a data filter.
+
+        Everything under the refs in ``unknowns`` (e.g. ``"input.fruits"``)
+        is left unknown; the rest is evaluated using ``input`` and the data
+        and policies already added. The residual conditions are translated
+        for ``target``/``dialect``:
+
+        - ``target="sql"`` with dialect ``postgresql``, ``mysql``,
+          ``sqlserver`` or ``sqlite``: returns a SQL WHERE clause string.
+        - ``target="ucast"`` with dialect ``all``, ``prisma``, ``linq`` or
+          ``""``: returns a UCAST condition object (JSON-compatible dict).
+
+        ``mappings`` optionally renames tables/columns (see the OPA docs on
+        Compile API mappings); ``mask_rule`` names a rule (e.g.
+        ``"data.filters.masks"``) evaluated to produce column masks.
+
+        Returns ``{"query": <str or dict or None>, "masks": <dict or None>}``.
+        A query of ``None`` means the policy can never be satisfied; an empty
+        query means it is always satisfied. Raises OpaError with code
+        ``compile_error`` if the residual policy cannot be expressed as a
+        filter for the chosen target.
+
+        Unknown refs are limited to ``input.<table>.<column>`` — exactly two
+        segments after ``input``, for every target/dialect, wherever the
+        declared unknown boundary sits (``mappings`` cannot deepen this):
+        ``unknowns=["input.item"]`` permits only ``input.item.<column>``,
+        the bare ``unknowns=["input"]`` permits ``input.<table>.<column>``.
+        Nested documents like ``input.item.attrs.price.value`` are rejected
+        and must be flattened into columns; a dynamic column picked from
+        known values (``input.attr[sprintf("value_%s", [input.locale])]``)
+        is fine, as it resolves during partial evaluation.
+        """
+        self._check_open()
+        envelope = self._call(
+            self._lib.OpaCompileFilters,
+            query.encode(),
+            _encode_input(input),
+            json.dumps(list(unknowns)).encode(),
+            target.encode(),
+            dialect.encode(),
+            b"" if mappings is None else json.dumps(mappings).encode(),
+            (mask_rule or "").encode(),
+        )
+        return envelope.get("result")
+
 
 def _encode_input(input):
     if input is None:

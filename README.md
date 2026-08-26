@@ -57,6 +57,51 @@ Notes:
   statement may appear multiple times (`Redo` on backtracking), and tracing
   slows evaluation, so keep it opt-in per call. Coverage only records *which*
   statements were evaluated; traces are how to see their results.
+- `compile_filters` partially evaluates a query and translates the residual
+  policy into a data filter (OPA's Compile-API / data-filter machinery):
+
+  ```python
+  engine.add_policy("filters.rego", """
+  package filters
+
+  include if input.fruits.colour == "green"
+  include if {
+      input.fruits.name == "banana"
+      input.user == "admin"
+  }
+  """)
+  engine.compile_filters(
+      "data.filters.include",
+      {"user": "admin"},              # known input
+      unknowns=["input.fruits"],      # left symbolic
+      target="sql", dialect="postgresql",
+  )
+  # -> {"query": "WHERE (fruits.colour = E'green' OR fruits.name = E'banana')",
+  #     "masks": None}
+  ```
+
+  `target="sql"` (dialects `postgresql`, `mysql`, `sqlserver`, `sqlite`)
+  yields a WHERE clause string; `target="ucast"` (dialects `all`, `prisma`,
+  `linq`, or `""`) yields a UCAST condition dict (the `ucast.json` wire
+  format). `query` is `None` when the policy can never match and `""`/`{}`
+  when it always matches. `mappings` renames tables/columns (e.g.
+  `{"fruits": {"$self": "fruit_table", "colour": "col"}}`), and `mask_rule`
+  names a rule evaluated to produce column masks (returned under `"masks"`).
+  Residual conditions that cannot be expressed for the chosen target raise
+  `OpaError(code="compile_error")`.
+
+  Unknown refs must have the shape `input.<table>.<column>` — exactly two
+  segments after `input`, whatever the declared unknown boundary is, and for
+  every target/dialect (`ucast`/`all` included; `mappings` cannot deepen it).
+  So `unknowns=["input.item"]` permits only `input.item.<column>`, while the
+  bare `unknowns=["input"]` permits `input.<table>.<column>`. Deeper refs
+  like `input.item.attrs.price.value` fail with `pe_fragment_error: invalid
+  ref operand`, so nested documents (e.g. an EAV entity with per-attribute
+  type/value objects, or per-locale value objects) must be flattened into
+  columns (`input.attr.value_number`, `input.attr.value_de`, ...). Dynamic
+  column choice is fine as long as the key is known at compile time:
+  `input.attr[sprintf("value_%s", [input.locale])]` resolves to a single
+  column during partial evaluation.
 - Rego `print(...)` output is captured per evaluation: set `engine.print_handler`
   to a `callable(message, location)` to receive it (default: written to stderr);
   `engine.last_prints` holds the `(message, location)` pairs of the last eval.
