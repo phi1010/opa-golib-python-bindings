@@ -26,7 +26,7 @@ Repository = "https://github.com/phi1010/opa-golib-python-bindings"
 Issues = "https://github.com/phi1010/opa-golib-python-bindings/issues"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "pyyaml"]
 
 [build-system]
 requires = ["hatchling"]
