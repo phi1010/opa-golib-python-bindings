@@ -1,6 +1,6 @@
 [project]
 name = "opa-golib-python-bindings"
-version = "0.4.0"
+version = "0.4.1"
 description = "Python bindings for the OPA (Open Policy Agent) Rego engine via a Go c-shared library"
 readme = "README.md"
 license = "Apache-2.0"
