@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from opa_bindings import OpaEngine, OpaError, OpaUndefinedError
@@ -294,6 +296,67 @@ def test_compile_filters_mappings(engine):
         mappings={"fruits": {"$self": "f", "colour": "col"}},
     )
     assert result["query"] == "WHERE f.col = 'green'"
+
+
+def test_compile_filters_malformed_mappings_rejected(engine):
+    # Non-string mapping values used to hit unchecked type assertions in the
+    # translator and kill the whole process; they must surface as OpaError.
+    engine.add_policy("filters.rego", FILTERS)
+    for bad in [
+        {"fruits": "f"},                              # table entry not an object
+        {"fruits": {"$self": 1}},                     # $self not a string
+        {"fruits": {"$table": ["f"]}},                # $table not a string
+        {"fruits": {"colour": {"column": "col"}}},    # column entry not a string
+        {"fruits": {"colour": 3}},                    # column entry not a string
+    ]:
+        with pytest.raises(OpaError) as ei:
+            engine.compile_filters(
+                "data.filters.include",
+                {"user": "nobody"},
+                unknowns=["input.fruits"],
+                target="sql",
+                dialect="sqlite",
+                mappings=bad,
+            )
+        assert ei.value.code == "invalid_json", bad
+    # The engine must still be usable afterwards.
+    assert engine.eval_query("1 == 1") == [{}]
+
+
+def test_concurrent_shared_builtin_evals(engine):
+    # Regression: a builtin's callback response buffer was dropped as soon as
+    # another eval called the same builtin; concurrent evals sharing one
+    # engine/builtin could then read freed memory. Ownership of each buffer
+    # now transfers to Go, so evals no longer race on buffer lifetime.
+    engine.register_function("many", lambda *args: list(args))
+    engine.add_policy("c.rego", 'package c\n\nr := many(["a", "b"])\n')
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(50):
+                assert engine.eval_document("c.r", None) == ["a", "b"]
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+
+
+def test_builtin_reentrant_eval(engine):
+    # A builtin that evaluates on the same engine re-enters the eval path;
+    # the per-engine eval lock is re-entrant so this must not deadlock.
+    def reentrant(x):
+        return engine.eval_document("inner.v")
+
+    engine.register_function("outer", reentrant)
+    engine.add_policy("outer.rego", 'package t\n\nr := outer(1)\n')
+    engine.add_policy("inner.rego", 'package inner\n\nv := 42\n')
+    assert engine.eval_document("t.r") == 42
 
 
 def test_compile_filters_never_and_always(engine):

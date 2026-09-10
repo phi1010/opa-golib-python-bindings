@@ -6,9 +6,10 @@ from pathlib import Path
 _LIB_PATH = Path(__file__).parent / "libopabridge.so"
 
 # char* (*opa_callback)(unsigned long long h, char* name, char* argsJson)
-# Return type is c_void_p so ctypes does not copy/free: the Python side keeps
-# the returned buffer alive until the callback is invoked again, and Go copies
-# it synchronously.
+# Return type is c_void_p so ctypes does not copy/free. The buffer is
+# malloc'd by the host with the C allocator and ownership transfers to the
+# Go side, which copies it and frees it with the same allocator; nothing on
+# the Python side retains the pointer.
 CALLBACK = ctypes.CFUNCTYPE(
     ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p
 )

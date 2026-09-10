@@ -4,6 +4,7 @@ import ctypes
 import inspect
 import json
 import sys
+import threading
 
 from . import _native
 
@@ -21,6 +22,7 @@ class OpaUndefinedError(OpaError):
 
 
 _lib = None
+_libc = None
 
 
 def _get_lib():
@@ -30,20 +32,59 @@ def _get_lib():
     return _lib
 
 
+def _get_libc():
+    """Handle for libc's malloc: callback response buffers are owned by the
+    Go side, which frees them with the C allocator (see _dispatch)."""
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(None)
+        _libc.malloc.restype = ctypes.c_void_p
+        _libc.malloc.argtypes = [ctypes.c_size_t]
+    return _libc
+
+
 class OpaEngine:
     """An embedded OPA policy engine instance.
 
     Policies are Rego modules added under a path, data is deep-merged JSON,
     and Python callables can be registered as custom Rego builtins.
+
+    Concurrency and resource notes:
+
+    - A single engine may be shared across threads: evaluations are
+      serialized by an internal re-entrant lock (which also allows a builtin
+      to evaluate on its own engine). Configuration calls (``add_policy``,
+      ``add_data``, ``register_function``) may interleave with evals from
+      other threads, as in the Go engine itself.
+    - Per-eval state (``last_coverage``, ``last_trace``, ``last_prints``)
+      reflects the most recently *completed* eval; under concurrent evals on
+      a shared engine these may interleave. Use one engine per thread, or
+      rely on return values instead of the ``last_*`` attributes, if that
+      matters.
+    - There are no built-in caps on memory or CPU: policy and data size,
+      number of engines (call ``close()`` to release one), and the number of
+      distinct queries evaluated are all bounded only by the process. Each
+      distinct query string is kept in a prepared-query cache on the engine
+      (invalidated by any configuration change), so applications that
+      evaluate unbounded attacker-shaped query strings grow memory without
+      bound — keep queries a fixed, application-controlled set.
     """
 
     def __init__(self):
         self._lib = _get_lib()
+        self._libc = _get_libc()
         self._handle = self._lib.OpaNew()
         self._functions = {}
-        # Buffers returned to Go must outlive the call; Go copies them
-        # synchronously, so keeping the latest buffer per builtin suffices.
-        self._callback_buffers = {}
+        # Serializes evals per engine so the per-eval callback buffer list
+        # below stays consistent even when multiple threads share an engine
+        # or a builtin re-enters eval on the same thread. A plain RLock: Go
+        # callbacks for this engine's builtins run on the calling thread while
+        # it holds the lock.
+        self._eval_lock = threading.RLock()
+        # Callback responses are malloc'd with the C allocator; Go frees them
+        # with OpaFreeString after copying (ownership transfer), so Python
+        # must NOT keep references. Buffers are only alive between _dispatch
+        # and the matching OpaFreeString, which the eval lock makes safe.
         self._trampoline = _native.CALLBACK(self._dispatch)
         #: Called as ``print_handler(message, location)`` for each Rego
         #: ``print(...)`` during evaluation; None writes them to stderr.
@@ -133,13 +174,20 @@ class OpaEngine:
         except Exception as e:  # never let an exception cross into Go
             response = {"error": repr(e)}
         try:
-            buf = ctypes.create_string_buffer(json.dumps(response).encode())
+            raw = json.dumps(response).encode()
         except Exception as e:
-            buf = ctypes.create_string_buffer(
-                json.dumps({"error": f"unserializable result: {e!r}"}).encode()
-            )
-        self._callback_buffers[name] = buf
-        return ctypes.addressof(buf)
+            raw = json.dumps({"error": f"unserializable result: {e!r}"}).encode()
+        # malloc with the C allocator: ownership of this buffer transfers to
+        # Go, which frees it with OpaFreeString (libc free) after copying.
+        # Nothing on the Python side retains the pointer. It must not be
+        # created with ctypes buffers — those use Python's allocator, which
+        # is not compatible with libc free.
+        buf = self._libc.malloc(len(raw) + 1)
+        if not buf:
+            return None  # Go reports "callback returned NULL"
+        ctypes.memmove(buf, raw, len(raw))
+        ctypes.memset(buf + len(raw), 0, 1)
+        return buf
 
     # -- public API ----------------------------------------------------
 
@@ -197,16 +245,17 @@ class OpaEngine:
         at each step, is stored in ``self.last_trace``.
         """
         self._check_open()
-        self._eval_reset()
-        rs = self._eval_result(
-            self._call(
-                self._lib.OpaEvalQuery,
-                query.encode(),
-                _encode_input(input),
-                int(coverage),
-                int(trace),
+        with self._eval_lock:
+            self._eval_reset()
+            rs = self._eval_result(
+                self._call(
+                    self._lib.OpaEvalQuery,
+                    query.encode(),
+                    _encode_input(input),
+                    int(coverage),
+                    int(trace),
+                )
             )
-        )
         if not rs:
             return []
         return [r.get("bindings", {}) for r in rs]
@@ -221,16 +270,17 @@ class OpaEngine:
         with ``trace=True`` the event trace is stored in ``self.last_trace``.
         """
         self._check_open()
-        self._eval_reset()
-        rs = self._eval_result(
-            self._call(
-                self._lib.OpaEvalDocument,
-                path.encode(),
-                _encode_input(input),
-                int(coverage),
-                int(trace),
+        with self._eval_lock:
+            self._eval_reset()
+            rs = self._eval_result(
+                self._call(
+                    self._lib.OpaEvalDocument,
+                    path.encode(),
+                    _encode_input(input),
+                    int(coverage),
+                    int(trace),
+                )
             )
-        )
         if not rs or not rs[0].get("expressions"):
             raise OpaUndefinedError(f"data.{path}" if path else "data")
         return rs[0]["expressions"][0]["value"]
@@ -279,16 +329,17 @@ class OpaEngine:
         is fine, as it resolves during partial evaluation.
         """
         self._check_open()
-        envelope = self._call(
-            self._lib.OpaCompileFilters,
-            query.encode(),
-            _encode_input(input),
-            json.dumps(list(unknowns)).encode(),
-            target.encode(),
-            dialect.encode(),
-            b"" if mappings is None else json.dumps(mappings).encode(),
-            (mask_rule or "").encode(),
-        )
+        with self._eval_lock:
+            envelope = self._call(
+                self._lib.OpaCompileFilters,
+                query.encode(),
+                _encode_input(input),
+                json.dumps(list(unknowns)).encode(),
+                target.encode(),
+                dialect.encode(),
+                b"" if mappings is None else json.dumps(mappings).encode(),
+                (mask_rule or "").encode(),
+            )
         return envelope.get("result")
 
 

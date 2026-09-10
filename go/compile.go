@@ -8,6 +8,7 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
@@ -23,6 +24,12 @@ import (
 //
 //export OpaCompileFilters
 func OpaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, dialect, mappingsJson, maskRule *C.char) *C.char {
+	return guard(func() *C.char {
+		return opaCompileFilters(h, query, inputJson, unknownsJson, target, dialect, mappingsJson, maskRule)
+	})
+}
+
+func opaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, dialect, mappingsJson, maskRule *C.char) *C.char {
 	e, err := getEngine(h)
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
@@ -56,6 +63,9 @@ func OpaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, di
 		if err := json.Unmarshal([]byte(s), &mappings); err != nil {
 			return errorJSON("invalid_json", err.Error())
 		}
+		if err := validateMappings(mappings); err != nil {
+			return errorJSON("invalid_json", err.Error())
+		}
 		copts = append(copts, regocompile.Mappings(mappings))
 	}
 
@@ -67,18 +77,21 @@ func OpaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, di
 		copts = append(copts, regocompile.MaskRule(ref))
 	}
 
-	e.mu.Lock()
-	ropts := []func(*rego.Rego){
-		rego.Store(inmem.NewFromObject(e.data)),
-		rego.StrictBuiltinErrors(true),
-	}
-	for path, src := range e.modules {
-		ropts = append(ropts, rego.Module(path, src))
-	}
-	for _, b := range e.builtins {
-		ropts = append(ropts, makeBuiltin(uint64(h), b))
-	}
-	e.mu.Unlock()
+	ropts := func() []func(*rego.Rego) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		ropts := []func(*rego.Rego){
+			rego.Store(inmem.NewFromObject(e.data)),
+			rego.StrictBuiltinErrors(true),
+		}
+		for path, src := range e.modules {
+			ropts = append(ropts, rego.Module(path, src))
+		}
+		for _, b := range e.builtins {
+			ropts = append(ropts, makeBuiltin(uint64(h), b))
+		}
+		return ropts
+	}()
 	copts = append(copts, regocompile.Rego(ropts...))
 
 	prepared, err := regocompile.New(copts...).Prepare(context.Background())
@@ -103,4 +116,29 @@ func OpaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, di
 	}
 	f := filters.For(tgt, dia)
 	return resultJSON(map[string]any{"query": f.Query, "masks": f.Masks})
+}
+
+// validateMappings enforces the shape OPA's translator assumes before the
+// mappings reach unchecked type assertions there: the top level maps table
+// (or unknown-short) names to objects; each entry maps column names to
+// strings, optionally alongside the string-valued "$self"/"$table" keys.
+// This returns an error instead of letting a malformed value panic and take
+// the whole host process down.
+func validateMappings(mappings map[string]any) error {
+	for table, tableMapping := range mappings {
+		tm, ok := tableMapping.(map[string]any)
+		if !ok {
+			return fmt.Errorf("mappings[%q]: table entry must be an object, got %T", table, tableMapping)
+		}
+		for column, columnMapping := range tm {
+			if _, ok := columnMapping.(string); ok {
+				continue
+			}
+			if column == "$self" || column == "$table" {
+				return fmt.Errorf("mappings[%q].%s: value must be a string, got %T", table, column, columnMapping)
+			}
+			return fmt.Errorf("mappings[%q].%q: column entry must be a string, got %T", table, column, columnMapping)
+		}
+	}
+	return nil
 }

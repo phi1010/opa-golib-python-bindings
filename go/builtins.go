@@ -62,12 +62,16 @@ func makeBuiltin(handle uint64, spec builtinSpec) func(*rego.Rego) {
 			if ret == nil {
 				return nil, fmt.Errorf("%s: callback returned NULL", spec.name)
 			}
-			// The host owns ret's buffer; copy it, do not free.
+			// The callback mallocs the response buffer and transfers ownership
+			// to us: copy the string out, then free with the C allocator via
+			// OpaFreeString. Nothing on the host side retains the pointer.
+			s := C.GoString(ret)
+			C.free(unsafe.Pointer(ret))
 			var envelope struct {
 				Result *json.RawMessage `json:"result"`
 				Error  *string          `json:"error"`
 			}
-			if err := json.Unmarshal([]byte(C.GoString(ret)), &envelope); err != nil {
+			if err := json.Unmarshal([]byte(s), &envelope); err != nil {
 				return nil, fmt.Errorf("%s: invalid callback response: %w", spec.name, err)
 			}
 			if envelope.Error != nil {

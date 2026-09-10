@@ -37,6 +37,10 @@ Notes:
 
 - `add_data` deep-merges objects; identical values coexist, conflicting values raise
   `OpaError(code="merge_conflict")` naming the conflicting path.
+- A Go-side panic in any bridge call surfaces as `OpaError(code="panic")`
+  instead of killing the process; the engine stays usable afterwards. (The
+  bridge also validates `compile_filters(mappings=...)` values are strings
+  and rejects malformed shapes with `OpaError(code="invalid_json")`.)
 - `register_function` infers arity from the callable's signature. A `*args` function is
   variadic and is called from Rego with a single array argument: `many(["a", "b"])`
   (OPA does not support variadic builtins with return values).
@@ -105,3 +109,22 @@ Notes:
 - Rego `print(...)` output is captured per evaluation: set `engine.print_handler`
   to a `callable(message, location)` to receive it (default: written to stderr);
   `engine.last_prints` holds the `(message, location)` pairs of the last eval.
+- **Concurrency:** an engine may be shared across threads — evals are
+  serialized by an internal re-entrant lock (builtins may evaluate on their
+  own engine). Per-eval state (`last_trace`, `last_coverage`, `last_prints`)
+  reflects the most recently *completed* eval, so with a shared engine prefer
+  return values over `last_*` attributes, or use one engine per thread.
+- **Resource limits / DoS:** there are no built-in caps. Policy/data sizes,
+  the number of engines (call `close()`; `__del__` is best-effort under GC),
+  and the set of distinct query strings (each is cached as a prepared query
+  on the engine, invalidated by any config change) are bounded only by the
+  process. If queries are dynamic or attacker-shaped, cap and canonicalize
+  them in the application; treat `query`, `policy source`, and `data` as
+  privileged inputs on a multi-tenant host. Rego itself can loop/compute
+  without limits, so the caller should apply timeouts/load controls at the
+  application layer if policies are untrusted.
+- **Confidentiality:** traces (`trace=True`) capture the plugged values of
+  local variables, and Rego `print()` calls see their arguments; both can
+  contain secrets from `input` or `data`. Keep them off shared logs, or
+  scrub them, when evaluating sensitive inputs. (The default print handler
+  writes to stderr.)

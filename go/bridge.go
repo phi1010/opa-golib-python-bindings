@@ -5,9 +5,10 @@ package main
 
 // Callback provided by the host (Python). It receives the engine handle, the
 // builtin name and the arguments as a JSON array. It returns a pointer to a
-// JSON envelope {"result": ...} or {"error": "..."}. The buffer is owned by
-// the host and must stay valid until the callback is invoked again; the Go
-// side copies it synchronously.
+// malloc'd JSON envelope {"result": ...} or {"error": "..."}. Ownership of the
+// buffer transfers to the Go side, which copies it synchronously and frees it
+// with the C allocator (see builtins.go). The host must not retain or reuse
+// the pointer after the callback returns.
 typedef char* (*opa_callback)(unsigned long long h, char* name, char* argsJson);
 */
 import "C"
@@ -92,6 +93,18 @@ func errorJSON(code, msg string) *C.char {
 	return C.CString(string(b))
 }
 
+// guard converts a panic in fn into a JSON error instead of letting it kill
+// the whole host process. Panics may fire while e.mu is held; deferred
+// unlocks still run during unwinding, so the engine stays usable.
+func guard(fn func() *C.char) (r *C.char) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			r = errorJSON("panic", fmt.Sprint(rec))
+		}
+	}()
+	return fn()
+}
+
 //export OpaNew
 func OpaNew() C.ulonglong {
 	registryMu.Lock()
@@ -107,6 +120,7 @@ func OpaNew() C.ulonglong {
 
 //export OpaDestroy
 func OpaDestroy(h C.ulonglong) {
+	defer func() { recover() }() // keep the host alive on any internal panic
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	delete(registry, uint64(h))
@@ -114,11 +128,16 @@ func OpaDestroy(h C.ulonglong) {
 
 //export OpaFreeString
 func OpaFreeString(s *C.char) {
+	defer func() { recover() }()
 	C.free(unsafe.Pointer(s))
 }
 
 //export OpaAddPolicy
 func OpaAddPolicy(h C.ulonglong, path, src *C.char) *C.char {
+	return guard(func() *C.char { return opaAddPolicy(h, path, src) })
+}
+
+func opaAddPolicy(h C.ulonglong, path, src *C.char) *C.char {
 	e, err := getEngine(h)
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
@@ -136,6 +155,10 @@ func OpaAddPolicy(h C.ulonglong, path, src *C.char) *C.char {
 
 //export OpaAddData
 func OpaAddData(h C.ulonglong, dataPath, jsonValue *C.char) *C.char {
+	return guard(func() *C.char { return opaAddData(h, dataPath, jsonValue) })
+}
+
+func opaAddData(h C.ulonglong, dataPath, jsonValue *C.char) *C.char {
 	e, err := getEngine(h)
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
@@ -170,6 +193,10 @@ func OpaAddData(h C.ulonglong, dataPath, jsonValue *C.char) *C.char {
 
 //export OpaRegisterBuiltin
 func OpaRegisterBuiltin(h C.ulonglong, name *C.char, arity C.int, cb C.opa_callback) *C.char {
+	return guard(func() *C.char { return opaRegisterBuiltin(h, name, arity, cb) })
+}
+
+func opaRegisterBuiltin(h C.ulonglong, name *C.char, arity C.int, cb C.opa_callback) *C.char {
 	e, err := getEngine(h)
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
@@ -189,17 +216,21 @@ func OpaRegisterBuiltin(h C.ulonglong, name *C.char, arity C.int, cb C.opa_callb
 
 //export OpaEvalQuery
 func OpaEvalQuery(h C.ulonglong, query, inputJson *C.char, coverage, trace C.int) *C.char {
-	return evalCommon(h, C.GoString(query), inputJson, coverage != 0, trace != 0)
+	return guard(func() *C.char {
+		return evalCommon(h, C.GoString(query), inputJson, coverage != 0, trace != 0)
+	})
 }
 
 //export OpaEvalDocument
 func OpaEvalDocument(h C.ulonglong, docPath, inputJson *C.char, coverage, trace C.int) *C.char {
-	p := C.GoString(docPath)
-	q := "data"
-	if p != "" {
-		q = "data." + p
-	}
-	return evalCommon(h, q, inputJson, coverage != 0, trace != 0)
+	return guard(func() *C.char {
+		p := C.GoString(docPath)
+		q := "data"
+		if p != "" {
+			q = "data." + p
+		}
+		return evalCommon(h, q, inputJson, coverage != 0, trace != 0)
+	})
 }
 
 func evalCommon(h C.ulonglong, query string, inputJson *C.char, coverage, trace bool) *C.char {
@@ -207,9 +238,12 @@ func evalCommon(h C.ulonglong, query string, inputJson *C.char, coverage, trace 
 	if err != nil {
 		return errorJSON("invalid_handle", err.Error())
 	}
-	e.mu.Lock()
-	pq, ok := e.prepared[query]
-	if !ok {
+	pq, err := func() (rego.PreparedEvalQuery, error) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if pq, ok := e.prepared[query]; ok {
+			return pq, nil
+		}
 		opts := []func(*rego.Rego){
 			rego.Query(query),
 			rego.Store(inmem.NewFromObject(e.data)),
@@ -222,14 +256,17 @@ func evalCommon(h C.ulonglong, query string, inputJson *C.char, coverage, trace 
 		for _, b := range e.builtins {
 			opts = append(opts, makeBuiltin(uint64(h), b))
 		}
-		pq, err = rego.New(opts...).PrepareForEval(context.Background())
+		pq, err := rego.New(opts...).PrepareForEval(context.Background())
 		if err != nil {
-			e.mu.Unlock()
-			return errorJSON("prepare_error", err.Error())
+			var zero rego.PreparedEvalQuery
+			return zero, err
 		}
 		e.prepared[query] = pq
+		return pq, nil
+	}()
+	if err != nil {
+		return errorJSON("prepare_error", err.Error())
 	}
-	e.mu.Unlock()
 
 	evalOpts := []rego.EvalOption{}
 	if inputJson != nil {
