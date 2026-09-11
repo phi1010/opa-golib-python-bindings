@@ -15,6 +15,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/types"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 func makeBuiltin(handle uint64, spec builtinSpec) func(*rego.Rego) {
@@ -82,7 +83,7 @@ func makeBuiltin(handle uint64, spec builtinSpec) func(*rego.Rego) {
 				return nil, nil
 			}
 			var v any
-			if err := json.Unmarshal(*envelope.Result, &v); err != nil {
+			if err := util.UnmarshalJSON(*envelope.Result, &v); err != nil {
 				return nil, err
 			}
 			val, err := ast.InterfaceToValue(v)

@@ -61,6 +61,32 @@ def test_data_merge_conflict(engine):
     assert "data.a.b" in ei.value.message
 
 
+def test_large_integers_keep_precision(engine):
+    # Regression: JSON from the host was decoded into float64, so integers
+    # beyond 2**53 collapsed onto their neighbours (e.g. two distinct user
+    # IDs comparing equal). Input, data and builtin results must stay exact.
+    big = 2**53 + 1
+    engine.add_policy(
+        "big.rego",
+        f"package big\n\nis_owner if input.uid == {big}\n\nfrom_fn := echo({big})\n",
+    )
+    engine.register_function("echo", lambda x: x)
+    engine.add_data({"n": big})
+    assert engine.eval_document("n") == big
+    assert engine.eval_document("big.is_owner", {"uid": big}) is True
+    with pytest.raises(OpaUndefinedError):
+        engine.eval_document("big.is_owner", {"uid": big - 1})
+    assert engine.eval_document("big.from_fn") == big
+
+    engine.add_policy("bigf.rego", "package bigf\n\ninclude if input.t.id == input.uid\n")
+    result = engine.compile_filters(
+        "data.bigf.include", {"uid": big}, unknowns=["input.t"], dialect="postgresql"
+    )
+    assert result["query"] == f"WHERE t.id = E'{big}'"
+    # The ucast target still rounds: OPA's UCASTNode.Map() round-trips through
+    # encoding/json into float64 (upstream, internal/compile/compile.go).
+
+
 def test_builtin_arities(engine):
     engine.register_function("zero", lambda: 42)
     engine.register_function("one", lambda x: x * 2)

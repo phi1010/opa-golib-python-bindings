@@ -26,6 +26,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"github.com/open-policy-agent/opa/v1/topdown/print"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 type printMsg struct {
@@ -164,7 +165,7 @@ func opaAddData(h C.ulonglong, dataPath, jsonValue *C.char) *C.char {
 		return errorJSON("invalid_handle", err.Error())
 	}
 	var v any
-	if err := json.Unmarshal([]byte(C.GoString(jsonValue)), &v); err != nil {
+	if err := util.UnmarshalJSON([]byte(C.GoString(jsonValue)), &v); err != nil {
 		return errorJSON("invalid_json", err.Error())
 	}
 	// Wrap the value in nested objects along dataPath.
@@ -273,7 +274,7 @@ func evalCommon(h C.ulonglong, query string, inputJson *C.char, coverage, trace 
 		s := C.GoString(inputJson)
 		if s != "" {
 			var input any
-			if err := json.Unmarshal([]byte(s), &input); err != nil {
+			if err := util.UnmarshalJSON([]byte(s), &input); err != nil {
 				return errorJSON("invalid_json", err.Error())
 			}
 			evalOpts = append(evalOpts, rego.EvalInput(input))

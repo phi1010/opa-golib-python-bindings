@@ -14,6 +14,7 @@ import (
 	"github.com/open-policy-agent/opa/v1/rego"
 	regocompile "github.com/open-policy-agent/opa/v1/rego/compile"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
+	"github.com/open-policy-agent/opa/v1/util"
 )
 
 // OpaCompileFilters partially evaluates a query with respect to the given
@@ -103,7 +104,7 @@ func opaCompileFilters(h C.ulonglong, query, inputJson, unknownsJson, target, di
 	if inputJson != nil {
 		if s := C.GoString(inputJson); s != "" {
 			var input any
-			if err := json.Unmarshal([]byte(s), &input); err != nil {
+			if err := util.UnmarshalJSON([]byte(s), &input); err != nil {
 				return errorJSON("invalid_json", err.Error())
 			}
 			evalOpts = append(evalOpts, rego.EvalInput(input))
