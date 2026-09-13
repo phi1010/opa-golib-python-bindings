@@ -1,6 +1,6 @@
 [project]
 name = "opa-golib-python-bindings"
-version = "0.4.3"
+version = "0.4.4"
 description = "Python bindings for the OPA (Open Policy Agent) Rego engine via a Go c-shared library"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,7 +26,7 @@ Repository = "https://github.com/phi1010/opa-golib-python-bindings"
 Issues = "https://github.com/phi1010/opa-golib-python-bindings/issues"
 
 [project.optional-dependencies]
-dev = ["pytest", "pyyaml"]
+dev = ["pytest", "pyyaml", "hypothesis"]
 
 [build-system]
 requires = ["hatchling"]
@@ -53,3 +53,4 @@ include = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+markers = ["fuzz: hypothesis fuzz tests of the Python/Go binding layer"]

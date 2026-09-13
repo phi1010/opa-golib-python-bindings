@@ -129,7 +129,12 @@ class OpaEngine:
             raise OpaError("closed", "engine has been closed")
 
     def _call(self, fn, *args):
-        ptr = fn(self._handle, *args)
+        # Read the handle once: another thread may close() the engine after
+        # _check_open(). A stale handle is rejected by the Go registry.
+        handle = self._handle
+        if handle is None:
+            raise OpaError("closed", "engine has been closed")
+        ptr = fn(handle, *args)
         if not ptr:
             raise OpaError("internal", "native call returned NULL")
         try:
@@ -174,7 +179,7 @@ class OpaEngine:
         except Exception as e:  # never let an exception cross into Go
             response = {"error": repr(e)}
         try:
-            raw = json.dumps(response).encode()
+            raw = _dumps(response)
         except Exception as e:
             raw = json.dumps({"error": f"unserializable result: {e!r}"}).encode()
         # malloc with the C allocator: ownership of this buffer transfers to
@@ -194,7 +199,7 @@ class OpaEngine:
     def add_policy(self, path: str, source: str):
         """Add a Rego module under the given path (module name)."""
         self._check_open()
-        self._call(self._lib.OpaAddPolicy, path.encode(), source.encode())
+        self._call(self._lib.OpaAddPolicy, _cstr(path), _cstr(source))
 
     def add_data(self, value, path: str = ""):
         """Deep-merge a JSON-compatible value into the data document.
@@ -203,7 +208,7 @@ class OpaEngine:
         Conflicting existing values raise OpaError(code="merge_conflict").
         """
         self._check_open()
-        self._call(self._lib.OpaAddData, path.encode(), json.dumps(value).encode())
+        self._call(self._lib.OpaAddData, _cstr(path), _dumps(value))
 
     def register_function(self, name: str, fn, *, arity: int | None = None):
         """Expose a Python callable as a Rego builtin.
@@ -228,7 +233,7 @@ class OpaEngine:
         self._functions[name] = (fn, arity)
         try:
             self._call(
-                self._lib.OpaRegisterBuiltin, name.encode(), arity, self._trampoline
+                self._lib.OpaRegisterBuiltin, _cstr(name), arity, self._trampoline
             )
         except Exception:
             del self._functions[name]
@@ -250,7 +255,7 @@ class OpaEngine:
             rs = self._eval_result(
                 self._call(
                     self._lib.OpaEvalQuery,
-                    query.encode(),
+                    _cstr(query),
                     _encode_input(input),
                     int(coverage),
                     int(trace),
@@ -275,7 +280,7 @@ class OpaEngine:
             rs = self._eval_result(
                 self._call(
                     self._lib.OpaEvalDocument,
-                    path.encode(),
+                    _cstr(path),
                     _encode_input(input),
                     int(coverage),
                     int(trace),
@@ -332,18 +337,44 @@ class OpaEngine:
         with self._eval_lock:
             envelope = self._call(
                 self._lib.OpaCompileFilters,
-                query.encode(),
+                _cstr(query),
                 _encode_input(input),
-                json.dumps(list(unknowns)).encode(),
-                target.encode(),
-                dialect.encode(),
-                b"" if mappings is None else json.dumps(mappings).encode(),
-                (mask_rule or "").encode(),
+                _dumps(list(unknowns)),
+                _cstr(target),
+                _cstr(dialect),
+                b"" if mappings is None else _dumps(mappings),
+                _cstr(mask_rule or ""),
             )
         return envelope.get("result")
+
+
+def _cstr(s: str) -> bytes:
+    """Encode a string for a char* argument.
+
+    Go reads C strings up to the first NUL, so an embedded NUL would silently
+    truncate the string (e.g. ``"a\\0b"`` aliasing ``"a"``). Lone surrogates
+    are not valid UTF-8 and would be replaced with U+FFFD, letting distinct
+    strings collide. Both are rejected.
+    """
+    if "\0" in s:
+        raise OpaError("invalid_argument", "string contains a NUL character")
+    try:
+        return s.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise OpaError("invalid_argument", f"string is not valid UTF-8: {e}") from None
+
+
+def _dumps(value) -> bytes:
+    """Serialize JSON for the Go side. NULs are escaped by json; encoding
+    without ensure_ascii makes lone surrogates (which Go would replace with
+    U+FFFD) fail instead of being escaped."""
+    try:
+        return json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise OpaError("invalid_argument", f"value is not valid UTF-8: {e}") from None
 
 
 def _encode_input(input):
     if input is None:
         return b""
-    return json.dumps(input).encode()
+    return _dumps(input)
